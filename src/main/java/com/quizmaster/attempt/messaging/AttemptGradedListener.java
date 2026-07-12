@@ -19,8 +19,7 @@ public class AttemptGradedListener {
 
     private final AttemptService attemptService;
 
-    @KafkaListener(topics = KafkaTopics.ATTEMPT_GRADED, groupId = "attempt-service",
-            autoStartup = "${app.kafka.enabled:true}")
+    @KafkaListener(topics = KafkaTopics.ATTEMPT_GRADED, groupId = "attempt-service")
     public void onAttemptGraded(AttemptGradedEvent event) {
         log.info("Applying grade for attempt={} marks={}/{}",
                 event.getAttemptUuid(), event.getMarksObtained(), event.getTotalMarksPossible());
