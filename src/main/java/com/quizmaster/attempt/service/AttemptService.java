@@ -66,7 +66,7 @@ public class AttemptService {
 
     @Transactional
     public StartAttemptResponse startAttempt(String quizUuidRaw, Long studentUserId, String studentEmail,
-            String ipAddress, String userAgent, String accessCode) {
+                                             String ipAddress, String userAgent, String accessCode) {
 
         UUID quizUuid = parseUuidOrThrow(quizUuidRaw, "quizUuid");
         QuizSnapshot snap = fetchSnapshot(quizUuidRaw);
@@ -301,6 +301,17 @@ public class AttemptService {
         attempt.setIsPassed(event.getIsPassed());
         attempt.setGradedAt(Instant.now());
 
+        // Essays still awaiting manual grading: store the provisional marks but
+        // do not rank the attempt yet. Ranks are recomputed once the last
+        // essay is graded (the event is re-emitted with pendingReviewCount = 0).
+        if (event.getPendingReviewCount() > 0) {
+            attempt.setRank(null);
+            attemptRepository.saveAndFlush(attempt);
+            log.info("Attempt {} has {} essay(s) pending review — result not released yet",
+                    event.getAttemptUuid(), event.getPendingReviewCount());
+            return;
+        }
+
         int betterCount = attemptRepository.countBetterAttempts(attempt.getQuizUuid(), attempt.getMarksObtained());
         attempt.setRank(betterCount + 1);
 
@@ -323,7 +334,7 @@ public class AttemptService {
     }
 
     private GradingJob buildGradingJob(QuizAttempt attempt, QuizSnapshot snap,
-            List<AttemptAnswer> answers, boolean autoSubmitted) {
+                                       List<AttemptAnswer> answers, boolean autoSubmitted) {
 
         List<GradingJob.JobQuestion> jobQuestions = (snap.getQuestions() == null ? List.<SnapshotQuestion>of() : snap.getQuestions())
                 .stream()
@@ -400,7 +411,19 @@ public class AttemptService {
                 .count();
         int wrongCount = answers.size() - correctCount - skippedCount - pendingReviewCount;
 
-        return attemptMapper.toResultResponse(attempt, correctCount, wrongCount, skippedCount, pendingReviewCount);
+        AttemptResultResponse res = attemptMapper.toResultResponse(
+                attempt, correctCount, wrongCount, skippedCount, pendingReviewCount);
+
+        // Don't release the score until every essay has been graded.
+        if (pendingReviewCount > 0) {
+            res.setMarksObtained(null);
+            res.setPositiveMarks(null);
+            res.setNegativeMarksDeducted(null);
+            res.setPercentage(null);
+            res.setIsPassed(null);
+            res.setRank(null);
+        }
+        return res;
     }
 
     @Transactional(readOnly = true)
@@ -411,6 +434,11 @@ public class AttemptService {
 
         if (attempt.getStatus() == AttemptStatus.IN_PROGRESS) {
             throw new BadRequestException("Attempt is still in progress");
+        }
+
+        if (answerRepository.countPendingReviewByAttemptId(attempt.getId()) > 0) {
+            throw new BadRequestException(
+                    "Result not released yet — some answers are still awaiting grading");
         }
 
         QuizSnapshot snap = readSnapshot(attempt);
@@ -427,8 +455,13 @@ public class AttemptService {
         return attemptRepository.findByStudentUserIdOrderByCreatedAtDesc(studentUserId, pageable)
                 .map(att -> {
                     AttemptHistoryResponse res = attemptMapper.toHistoryResponse(att);
-                    res.setHasPendingReview(
-                            answerRepository.countPendingReviewByAttemptId(att.getId()) > 0);
+                    boolean pending = answerRepository.countPendingReviewByAttemptId(att.getId()) > 0;
+                    res.setHasPendingReview(pending);
+                    if (pending) {
+                        res.setMarksObtained(null);
+                        res.setPercentage(null);
+                        res.setIsPassed(null);
+                    }
                     return res;
                 });
     }

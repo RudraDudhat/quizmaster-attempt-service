@@ -48,24 +48,57 @@ public interface QuizAttemptRepository extends JpaRepository<QuizAttempt, Long> 
     List<QuizAttempt> findByStudentEmailAndQuizUuidAndStatusIn(
             String studentEmail, UUID quizUuid, List<AttemptStatus> statuses);
 
-    @Query("SELECT COUNT(a) FROM QuizAttempt a WHERE a.quizUuid = :quizUuid AND a.status IN ('SUBMITTED','AUTO_SUBMITTED') AND a.marksObtained > :marks")
+    /**
+     * Attempts that beat the given marks. Attempts with essays still awaiting
+     * manual grading are excluded — their score is provisional.
+     */
+    @Query("""
+            SELECT COUNT(a) FROM QuizAttempt a
+            WHERE a.quizUuid = :quizUuid
+              AND a.status IN ('SUBMITTED','AUTO_SUBMITTED')
+              AND a.marksObtained > :marks
+              AND NOT EXISTS (
+                  SELECT aa.id FROM AttemptAnswer aa
+                  WHERE aa.attempt = a
+                    AND aa.isCorrect IS NULL
+                    AND aa.isSkipped = false
+              )
+            """)
     int countBetterAttempts(@Param("quizUuid") UUID quizUuid, @Param("marks") java.math.BigDecimal marks);
 
     /**
      * Recompute rank for every submitted attempt of a quiz using a RANK()
      * window so ties share a rank and earlier attempts get pushed down when a
      * higher-scoring attempt is added later. Scoped by quiz_uuid.
+     *
+     * Only fully graded attempts are ranked. Attempts with an essay still
+     * awaiting manual grading (is_correct IS NULL and not skipped) get a NULL
+     * rank and do not push anyone else down; they are ranked once the last
+     * essay is graded.
      */
     @Modifying
     @Query(value = """
             UPDATE quiz_attempts qa
             SET "rank" = ranked.new_rank
             FROM (
-                SELECT id,
-                       RANK() OVER (ORDER BY marks_obtained DESC) AS new_rank
-                FROM quiz_attempts
-                WHERE quiz_uuid = :quizUuid
-                  AND status IN ('SUBMITTED', 'AUTO_SUBMITTED')
+                SELECT t.id,
+                       CASE WHEN t.pending THEN NULL
+                            ELSE RANK() OVER (PARTITION BY t.pending
+                                              ORDER BY t.marks_obtained DESC)
+                       END AS new_rank
+                FROM (
+                    SELECT q.id,
+                           q.marks_obtained,
+                           EXISTS (
+                               SELECT 1 FROM attempt_answers aa
+                               WHERE aa.attempt_id = q.id
+                                 AND aa.is_correct IS NULL
+                                 AND aa.is_skipped = false
+                           ) AS pending
+                    FROM quiz_attempts q
+                    WHERE q.quiz_uuid = :quizUuid
+                      AND q.status IN ('SUBMITTED', 'AUTO_SUBMITTED')
+                ) t
             ) AS ranked
             WHERE qa.id = ranked.id
             """, nativeQuery = true)
